@@ -2,6 +2,9 @@
 venv/
 __pycache__/
 *.pyc
+*.db
+*.sqlite
+chronorag.db
 .chroma/
 chroma_db/
 *.log
