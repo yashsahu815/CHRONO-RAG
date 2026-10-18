@@ -1,24 +1,190 @@
 import io
+import os
+import sys
 import csv
 import math
 import base64
 import datetime
+import importlib
+import sqlite3
 import requests
 import streamlit as st
 import chromadb
 from PIL import Image, ImageOps, ImageDraw
 from sentence_transformers import SentenceTransformer
 
-import database as db
+# 1. Path & Database Safe Resolution
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
-# 1. Page Configuration
+import database as db
+try:
+    importlib.reload(db)
+except Exception:
+    pass
+
+# Ensure SQLite schema is prepared
+def _ensure_database_schema():
+    db_path = getattr(db, "DB_PATH", os.path.join(BASE_DIR, "chronorag.db"))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    with conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL COLLATE NOCASE,
+            email TEXT UNIQUE NOT NULL COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            role TEXT DEFAULT 'Student',
+            phone TEXT DEFAULT '',
+            organization TEXT DEFAULT '',
+            avatar_blob BLOB,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            default_target_year INTEGER DEFAULT 2026,
+            default_lambda REAL DEFAULT 0.35,
+            api_endpoint TEXT DEFAULT 'https://api.chronorag.internal/v1/policies',
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS regulatory_documents (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            issuing_authority TEXT NOT NULL,
+            circular_no TEXT NOT NULL,
+            doc_type TEXT NOT NULL,
+            publication_date TEXT NOT NULL,
+            effective_date TEXT NOT NULL,
+            applicable_year INTEGER NOT NULL,
+            source_url TEXT DEFAULT '',
+            summary TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            verification_status TEXT DEFAULT 'Indexed — Pending Verification',
+            uploaded_by TEXT DEFAULT 'system',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS regulatory_chunks (
+            id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            section_heading TEXT NOT NULL,
+            page_number INTEGER DEFAULT 1,
+            chunk_text TEXT NOT NULL,
+            FOREIGN KEY (doc_id) REFERENCES regulatory_documents(id) ON DELETE CASCADE
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS regulatory_changes (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            start_year INTEGER NOT NULL,
+            end_year INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            earlier_doc_id TEXT,
+            earlier_clause_ref TEXT,
+            earlier_text TEXT,
+            earlier_date TEXT,
+            updated_doc_id TEXT,
+            updated_clause_ref TEXT,
+            updated_text TEXT,
+            updated_date TEXT,
+            effective_date TEXT,
+            summary TEXT NOT NULL,
+            change_reason TEXT,
+            verification_status TEXT DEFAULT 'Verified',
+            FOREIGN KEY (earlier_doc_id) REFERENCES regulatory_documents(id),
+            FOREIGN KEY (updated_doc_id) REFERENCES regulatory_documents(id)
+        );
+        """)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM regulatory_documents WHERE issuing_authority = 'IRDAI'")
+        if cursor.fetchone()[0] == 0:
+            doc_2020 = ("IRDAI_CIR_2020_GSV", "IRDAI (Non-Linked Insurance Products) Regulations - Vesting and Surrender Scale", "IRDAI", "Ref: IRDAI/NL/CIR/2019-20/124", "Gazette Notification", "2020-02-01", "2020-02-01", 2020, "https://irdai.gov.in/notifications", "Mandated 3-year minimum premium payment before acquiring Guaranteed Surrender Value (GSV) with 100% first-year forfeiture.", "Section 7.2: A policy shall acquire a Guaranteed Surrender Value (GSV) only after payment of continuous premiums for at least 3 consecutive years. If a policy is surrendered prior to 3 consecutive years, zero surrender payout is admissible, and 100% of all paid premiums shall be forfeited to the insurer.", "Verified", "system")
+            doc_2024 = ("IRDAI_MASTER_CIR_2024", "IRDAI Master Circular on Life Insurance Products - Abolition of Year 1 Forfeiture", "IRDAI", "IRDAI/ACTL/MST/CIR/116/06/2024", "Master Circular", "2024-06-12", "2024-10-01", 2024, "https://irdai.gov.in/master-circulars", "Abolished complete premium forfeiture on Year 1 surrender and mandated Special Surrender Value (SSV) after 1 full year.", "Chapter III, Clause 14.1: Insurers shall not forfeit the entire premium paid under non-linked life insurance policies upon early discontinuance. A policy shall acquire a Special Surrender Value (SSV) upon payment of full premiums for at least one full policy year.", "Verified", "system")
+            doc_2026 = ("LIC_OP_DIR_2026", "LIC Operational Directive on Statutory G-Sec Benchmark SSV Computations", "LIC of India", "LIC/CO/ACT/2026/DIR-04", "Operational Directive", "2026-03-15", "2026-04-01", 2026, "https://licindia.in/guidelines", "Operationalized discounted cash-flow valuation linked to 10-Yr Indian G-Sec benchmark yield plus 50 bps spread for Year 1 exits.", "Directive Clause 4(b): Pursuant to statutory IRDAI mandates, all individual endowment and non-linked products guarantee a Special Surrender Value payable after Year 1. Payouts are computed by discounting accumulated premiums and accrued bonuses against the prevailing 10-year Indian Government Securities (G-Sec) benchmark yield plus a statutory 50 bps margin.", "Verified", "system")
+            cursor.executemany("INSERT OR REPLACE INTO regulatory_documents (id, title, issuing_authority, circular_no, doc_type, publication_date, effective_date, applicable_year, source_url, summary, raw_text, verification_status, uploaded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [doc_2020, doc_2024, doc_2026])
+            
+            chunks = [
+                ("CHK_2020_1", "IRDAI_CIR_2020_GSV", 1, "Section 7.2: Vesting and Forfeiture Scale", 12, "Section 7.2: A policy shall acquire a Guaranteed Surrender Value (GSV) only after payment of continuous premiums for at least 3 consecutive years. If a policy is surrendered prior to 3 consecutive years, zero surrender payout is admissible, and 100% of all paid premiums shall be forfeited to the insurer."),
+                ("CHK_2024_1", "IRDAI_MASTER_CIR_2024", 1, "Chapter III Clause 14.1: Prohibition of Complete Premium Forfeiture", 28, "Chapter III, Clause 14.1: Insurers shall not forfeit the entire premium paid under non-linked life insurance policies upon early discontinuance. A policy shall acquire a Special Surrender Value (SSV) upon payment of full premiums for at least one full policy year."),
+                ("CHK_2026_1", "LIC_OP_DIR_2026", 1, "Directive Clause 4(b): G-Sec Linked Discounting Methodology", 4, "Directive Clause 4(b): Pursuant to statutory IRDAI mandates, all individual endowment and non-linked products guarantee a Special Surrender Value payable after Year 1. Payouts are computed by discounting accumulated premiums and accrued bonuses against the prevailing 10-year Indian Government Securities (G-Sec) benchmark yield plus a statutory 50 bps margin.")
+            ]
+            cursor.executemany("INSERT OR REPLACE INTO regulatory_chunks (id, doc_id, chunk_index, section_heading, page_number, chunk_text) VALUES (?, ?, ?, ?, ?, ?)", chunks)
+
+            changes = [
+                ("CHG_01", "Surrender Value Scale Reform", "IRDAI / LIC", 2020, 2024, "Amended provisions", "IRDAI_CIR_2020_GSV", "Section 7.2", "80% after 2 years; 100% forfeiture in Year 1.", "2020-02-01", "IRDAI_MASTER_CIR_2024", "Clause 14.1", "85% after 2 years; statutory exit payout guaranteed after 1 full year.", "2024-06-12", "2024-10-01", "Abolished total first-year forfeiture; policyholders acquire Special Surrender Value after Year 1.", "Curbing early-lapse policyholder capital erosion.", "Verified")
+            ]
+            cursor.executemany("INSERT OR REPLACE INTO regulatory_changes (id, title, authority, start_year, end_year, category, earlier_doc_id, earlier_clause_ref, earlier_text, earlier_date, updated_doc_id, updated_clause_ref, updated_text, updated_date, effective_date, summary, change_reason, verification_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
+    conn.close()
+
+_ensure_database_schema()
+
+# Bind helper functions if missing from module
+if not hasattr(db, "get_all_regulatory_documents"):
+    def _get_all_docs(verified_only: bool = False):
+        db_path = getattr(db, "DB_PATH", os.path.join(BASE_DIR, "chronorag.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        if verified_only:
+            c.execute("SELECT * FROM regulatory_documents WHERE verification_status = 'Verified' ORDER BY applicable_year DESC")
+        else:
+            c.execute("SELECT * FROM regulatory_documents ORDER BY applicable_year DESC")
+        res = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return res
+    db.get_all_regulatory_documents = _get_all_docs
+
+if not hasattr(db, "get_chunks_for_document"):
+    def _get_chunks(doc_id: str):
+        db_path = getattr(db, "DB_PATH", os.path.join(BASE_DIR, "chronorag.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM regulatory_chunks WHERE doc_id = ? ORDER BY chunk_index ASC", (doc_id,))
+        res = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return res
+    db.get_chunks_for_document = _get_chunks
+
+if not hasattr(db, "get_regulatory_document_by_id"):
+    def _get_doc(doc_id: str):
+        db_path = getattr(db, "DB_PATH", os.path.join(BASE_DIR, "chronorag.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM regulatory_documents WHERE id = ?", (doc_id,))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    db.get_regulatory_document_by_id = _get_doc
+
+# 2. Page Configuration
 st.set_page_config(
     page_title="ChronoRAG: Regulatory Policy Portal",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# 2. Lucide Vector Icon Data URIs
+# 3. Lucide Vector Icon Data URIs
 SVG_HOUSE_MUTED = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3Cpolyline points='9 22 9 12 15 12 15 22'/%3E%3C/svg%3E"
 SVG_HOUSE_ACTIVE = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3Cpolyline points='9 22 9 12 15 12 15 22'/%3E%3C/svg%3E"
 
@@ -35,7 +201,7 @@ SVG_SECURITY = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' wid
 SVG_SYSTEM = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%238fa0ba' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='16' height='16' x='4' y='4' rx='2'/%3E%3Crect width='6' height='6' x='9' y='9' rx='1'/%3E%3Cpath d='M15 2v2'/%3E%3Cpath d='M15 20v2'/%3E%3Cpath d='M2 15h2'/%3E%3Cpath d='M2 9h2'/%3E%3Cpath d='M20 15h2'/%3E%3Cpath d='M20 9h2'/%3E%3Cpath d='M9 2v2'/%3E%3Cpath d='M9 20v2'/%3E%3C/svg%3E"
 SVG_LOGOUT = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23ef4444' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4'/%3E%3Cpolyline points='16 17 21 12 16 7'/%3E%3Cline x1='21' x2='9' y1='12' y2='12'/%3E%3C/svg%3E"
 
-# 3. Base Reference Matching Dark Theme CSS
+# 4. Reference Matching Dark Theme CSS
 CUSTOM_CSS = f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -125,7 +291,7 @@ div[data-testid="stPopover"] > button::after {{
     vertical-align: middle;
 }}
 
-/* Floating Overlay Panel: Exact styling from screenshot */
+/* Floating Overlay Panel */
 div[data-testid="stPopoverBody"] {{
     background-color: #0b1328 !important;
     border: 1px solid #1c2d4a !important;
@@ -375,11 +541,74 @@ div.stButton > button[kind="secondary"] {{
     font-size: 0.8125rem;
     color: #64748b;
 }}
+
+/* LIC Dedicated Portal Styles */
+.action-card {{
+    background: #091122;
+    border: 1px solid #142138;
+    border-radius: 8px;
+    padding: 1.25rem 1.15rem;
+    min-height: 145px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    transition: all 0.15s ease-in-out;
+}}
+.action-card:hover {{
+    border-color: #1e5de3;
+    background: #0b1428;
+}}
+.action-card-icon {{
+    background-color: #0f1c34;
+    border: 1px solid #1a2e54;
+    width: 36px;
+    height: 36px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 0.65rem;
+}}
+.timeline-dot {{
+    width: 10px;
+    height: 10px;
+    background-color: #1e5de3;
+    border-radius: 50%;
+    display: inline-block;
+    box-shadow: 0 0 0 4px rgba(30, 93, 227, 0.2);
+}}
+.citation-card {{
+    background: #091122;
+    border: 1px solid #142138;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}}
+.badge-verified {{
+    background-color: #062b1e;
+    color: #10b981;
+    border: 1px solid #059669;
+    padding: 0.15rem 0.55rem;
+    border-radius: 4px;
+    font-size: 0.72rem;
+    font-weight: 600;
+}}
+.badge-pending {{
+    background-color: #2b1f06;
+    color: #f59e0b;
+    border: 1px solid #d97706;
+    padding: 0.15rem 0.55rem;
+    border-radius: 4px;
+    font-size: 0.72rem;
+    font-weight: 600;
+}}
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# 4. Session State Setup
+# 5. Session State Setup
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = None
 
@@ -388,6 +617,12 @@ if "active_tab" not in st.session_state:
 
 if "sub_view" not in st.session_state:
     st.session_state["sub_view"] = "MAIN"
+
+if "lic_screen" not in st.session_state:
+    st.session_state["lic_screen"] = "HUB"  # HUB, QA, COMPARE, TIMELINE, LIBRARY
+
+if "lic_qa_query" not in st.session_state:
+    st.session_state["lic_qa_query"] = ""
 
 if "auth_mode" not in st.session_state:
     st.session_state["auth_mode"] = "LOGIN"
@@ -435,7 +670,7 @@ if "editor_rotation" not in st.session_state:
 if "editor_fit_mode" not in st.session_state:
     st.session_state["editor_fit_mode"] = "Fill Circle"
 
-# 5. Regulatory Datasets
+# 6. Regulatory Datasets
 POLICIES_DATABASE = [
     {
         "id": "IRDAI_CIR_2020_ENDOW",
@@ -538,7 +773,7 @@ REPORTS_DATABASE = [
     {"id": "REP-12", "title": "Railways - PRS Counter Waitlist Operational Study", "org": "Indian Railways", "sector": "Transport", "date": "Aug 11, 2026", "type": "Report"}
 ]
 
-# 6. Cached In-Memory Vector Store
+# 7. Cached In-Memory Vector Store
 @st.cache_resource(show_spinner=False)
 def load_rag_engine(_policies):
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -582,7 +817,7 @@ def get_initials(name_str: str) -> str:
         return parts[0][:2].upper()
     return "YS"
 
-# 7. Image Cropping and Resizing Pipeline
+# 8. Image Cropping and Resizing Pipeline
 def process_avatar_image(
     image_bytes: bytes,
     mode: str = "Fill Circle",
@@ -745,7 +980,7 @@ else:
     """
 st.markdown(avatar_navbar_css, unsafe_allow_html=True)
 
-# 8. Interactive Top Navigation Bar (Identical Layout & Spacing)
+# 9. Top Navigation Bar
 nav_brand, nav_home, nav_rep, nav_kb, nav_prof = st.columns([5.6, 1.1, 1.1, 1.6, 1.9])
 
 with nav_brand:
@@ -762,10 +997,11 @@ with nav_brand:
     """, unsafe_allow_html=True)
 
 with nav_home:
-    is_home = (st.session_state["active_tab"] == "Home")
+    is_home = (st.session_state["active_tab"] == "Home" and st.session_state["sub_view"] == "MAIN")
     if st.button("Home", key="nav_item_home", type="primary" if is_home else "secondary", use_container_width=True):
         st.session_state["active_tab"] = "Home"
         st.session_state["sub_view"] = "MAIN"
+        st.session_state["lic_screen"] = "HUB"
         st.rerun()
 
 with nav_rep:
@@ -838,6 +1074,8 @@ with nav_prof:
 # TAB 1: HOME
 # ==============================================================================
 if st.session_state["active_tab"] == "Home":
+
+    # PRIMARY HOME PAGE
     if st.session_state["sub_view"] == "MAIN":
         st.markdown("""
         <div class="breadcrumb-text">
@@ -866,17 +1104,18 @@ if st.session_state["active_tab"] == "Home":
                         </div>
                         <div>
                             <div class="card-title">LIC / IRDAI</div>
-                            <div class="card-subtitle">Sector: Life Insurance and Investment</div>
+                            <div class="card-subtitle">Life Insurance & Investment</div>
                         </div>
                     </div>
                     <div class="card-body-text">
-                        Major policy shifts in surrender values, lock-in periods, and 1st-year exits (2020 to 2026).
+                        Live RAG Question Answering, Year-to-Year regulatory comparison (2020-2026), and verified circular diffs.
                     </div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            if st.button("Open LIC Portal", key="btn_open_lic", type="primary", use_container_width=True):
+            if st.button("Open LIC Portal ➔", key="btn_open_lic", type="primary", use_container_width=True):
                 st.session_state["sub_view"] = "LIC"
+                st.session_state["lic_screen"] = "HUB"
                 st.rerun()
 
         with col2:
@@ -894,11 +1133,11 @@ if st.session_state["active_tab"] == "Home":
                         </div>
                         <div>
                             <div class="card-title">EPFO</div>
-                            <div class="card-subtitle">Sector: Social Security and Provident Fund</div>
+                            <div class="card-subtitle">Social Security & PF</div>
                         </div>
                     </div>
                     <div class="card-body-text">
-                        Transition from manual Form 31 medical processing to 72-hour IT auto-settlement up to 100,000 INR.
+                        Transition from manual Form 31 processing to 72-hour IT auto-settlement up to ₹100,000.
                     </div>
                 </div>
             </div>
@@ -918,7 +1157,7 @@ if st.session_state["active_tab"] == "Home":
                         </div>
                         <div>
                             <div class="card-title">Indian Railways</div>
-                            <div class="card-subtitle">Sector: Public Transport and Ticketing</div>
+                            <div class="card-subtitle">Public Transport</div>
                         </div>
                     </div>
                     <div class="card-body-text">
@@ -988,124 +1227,342 @@ if st.session_state["active_tab"] == "Home":
         </table>
         """, unsafe_allow_html=True)
 
+    # DEDICATED LIC PORTAL
     elif st.session_state["sub_view"] == "LIC":
-        top_col1, top_col2 = st.columns([9, 3])
-        with top_col1:
+        lic_nav_l, lic_nav_r = st.columns([9.5, 2.5])
+        with lic_nav_l:
             st.markdown("""
-            <div style="font-size: 1.5rem; font-weight: 700; color: #ffffff;">LIC Policy Regulatory Intelligence Portal</div>
-            <div style="font-size: 0.8125rem; color: #94a3b8; margin-bottom: 1.5rem;">
-                Target Entity: <strong>Life Insurance Corporation of India</strong> | Dual-Route Temporal Retrieval
+            <div class="breadcrumb-text">
+                Home &nbsp;&gt;&nbsp; <span class="breadcrumb-active">LIC Policy Regulatory Intelligence</span>
             </div>
             """, unsafe_allow_html=True)
-        with top_col2:
-            if st.button("Back to Portal Hub", key="btn_back_home", type="secondary", use_container_width=True):
+        with lic_nav_r:
+            if st.button("← Back to Home Hub", key="btn_back_to_home_hub", use_container_width=True):
                 st.session_state["sub_view"] = "MAIN"
+                st.session_state["lic_screen"] = "HUB"
                 st.rerun()
 
-        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([4, 4, 4])
-        with ctrl_col1:
-            mode = st.selectbox("Pipeline Mode", ["Timeline Evolution (Audit)", "Point-in-Time (Decay)"])
-        with ctrl_col2:
-            target_year = st.number_input("Target Year", min_value=2018, max_value=2030, value=int(user_data["default_target_year"]), step=1)
-        with ctrl_col3:
-            decay_lambda = st.slider("Decay Factor (Lambda)", min_value=0.0, max_value=1.0, value=float(user_data["default_lambda"]), step=0.05)
-
-        query = st.text_input(
-            "Enter policy question for vector retrieval:",
-            value="What changed in LIC surrender value rules between 2020 and 2026, and what was removed?"
-        )
-
-        query_emb = embedder.encode([query]).tolist()[0]
-        lic_docs = [p for p in POLICIES_DATABASE if "LIC" in p["org"]]
-        results = collection.query(
-            query_embeddings=[query_emb],
-            n_results=len(lic_docs),
-            include=["documents", "metadatas", "distances"]
-        )
-
-        if mode == "Timeline Evolution (Audit)":
-            st.markdown("##### Regulatory Timeline Audit (2020 to 2026)")
-            card_cols = st.columns(len(lic_docs))
-            sorted_docs = sorted(lic_docs, key=lambda x: x["year"])
-
-            for i, doc in enumerate(sorted_docs):
-                with card_cols[i]:
-                    badge_color = "#10b981" if doc["year"] == 2026 else ("#60a5fa" if doc["year"] == 2025 else ("#eab308" if doc["year"] == 2024 else "#ef4444"))
-                    st.markdown(f"""
-                    <div style="background: #091122; border: 1px solid #142138; border-radius: 6px; padding: 1.25rem; min-height: 250px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                            <span style="font-weight: 700; font-size: 1.1rem; color: #ffffff;">Year {doc['year']}</span>
-                            <span style="font-size: 0.72rem; padding: 0.15rem 0.45rem; border-radius: 3px; font-weight: 600; border: 1px solid {badge_color}; color: {badge_color};">
-                                {doc['status']}
-                            </span>
-                        </div>
-                        <div style="font-size: 0.75rem; color: #64748b; margin-bottom: 0.5rem;">{doc['circular_no']}</div>
-                        <div style="font-size: 0.8125rem; color: #cbd5e1; line-height: 1.5;">{doc['text']}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
-            st.markdown("##### Regulatory Clause Diff Matrix")
+        # SCREEN 1: Main Landing Page
+        if st.session_state["lic_screen"] == "HUB":
             st.markdown("""
-| Regulatory Dimension | 2020 Baseline | 2024 Reform Circular | 2026 Operational Directive | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **Year 1 Premium Forfeiture** | 100% forfeited on exit | Total forfeiture prohibited | Guaranteed statutory payout | Abolished |
-| **Minimum Lock-in Period** | 3 Consecutive Policy Years | Reduced to 1 Full Year | 1 Full Year standard across plans | Relaxed |
-| **Special Surrender Value** | Not available before Year 3 | Introduced for Year 1 exits | Mandatory statutory entitlement | Enacted |
-| **Valuation Methodology** | Fixed percentage table | Transitional SSV formula | Discounted by 10-Yr G-Sec + 50 bps | Standardized |
-""")
+            <div class="hero-title">LIC Policy Intelligence</div>
+            <div class="hero-sub">Find, compare, and verify LIC / IRDAI rules</div>
+            """, unsafe_allow_html=True)
 
-        else:
-            st.markdown(f"##### Point-in-Time Diagnostic: Target Year {target_year} (Lambda = {decay_lambda})")
-            standard_ranks = []
-            chrono_ranks = []
-
-            for doc_id, text, meta, dist in zip(
-                results["ids"][0], results["documents"][0], results["metadatas"][0], results["distances"][0]
-            ):
-                sim = max(0.0, 1.0 - dist)
-                doc_year = meta["year"]
-                penalty = math.exp(-decay_lambda * abs(target_year - doc_year))
-                final_score = sim * penalty
-
-                standard_ranks.append({"id": doc_id, "year": doc_year, "text": text, "score": sim, "meta": meta})
-                chrono_ranks.append({"id": doc_id, "year": doc_year, "text": text, "penalty": penalty, "score": final_score, "meta": meta})
-
-            standard_ranks.sort(key=lambda x: x["score"], reverse=True)
-            chrono_ranks.sort(key=lambda x: x["score"], reverse=True)
-
-            c1, c2 = st.columns(2)
+            c1, c2, c3, c4 = st.columns(4)
             with c1:
-                st.markdown("**Standard RAG (Cosine Only)**")
-                st.caption("Time-blind: Retrieves by keyword match, vulnerable to superseded policies.")
-                for i, item in enumerate(standard_ranks, 1):
-                    is_obsolete = item["year"] < target_year
-                    tag = "SUPERSEDED" if is_obsolete and i == 1 else item["meta"]["status"]
-                    st.markdown(f"""
-                    <div style="background: #091122; border: 1px solid #142138; border-radius: 6px; padding: 1rem; margin-bottom: 0.75rem;">
-                        <div style="display: flex; justify-content: space-between; font-size: 0.8125rem;">
-                            <strong>Rank {i}: {item['id']} ({item['year']})</strong>
-                            <span style="color: {'#ef4444' if is_obsolete else '#94a3b8'};">[{tag}]</span>
+                st.markdown("""
+                <div class="action-card">
+                    <div>
+                        <div class="action-card-icon">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e5de3" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                         </div>
-                        <div style="font-size: 0.75rem; color: #64748b; margin: 0.25rem 0;">Cosine Similarity: {item['score']:.4f}</div>
-                        <div style="font-size: 0.8125rem; color: #cbd5e1;">{item['text']}</div>
+                        <div style="font-weight: 700; font-size: 0.95rem; color: #fff; margin-bottom: 0.2rem;">Ask a Policy Question</div>
+                        <div style="font-size: 0.785rem; color: #798da8;">Get answers from verified LIC / IRDAI documents</div>
                     </div>
-                    """, unsafe_allow_html=True)
+                    <div style="text-align: right; color: #1e5de3; font-weight: 600;">➔</div>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("Open Q&A", key="lic_act_qa", use_container_width=True):
+                    st.session_state["lic_screen"] = "QA"
+                    st.rerun()
 
             with c2:
-                st.markdown("**ChronoRAG (Time-Decayed)**")
-                st.caption("Time-aware: Applies exponential penalty to surface temporally valid clauses.")
-                for i, item in enumerate(chrono_ranks, 1):
-                    st.markdown(f"""
-                    <div style="background: #091122; border: 1px solid #142138; border-radius: 6px; padding: 1rem; margin-bottom: 0.75rem;">
-                        <div style="display: flex; justify-content: space-between; font-size: 0.8125rem;">
-                            <strong>Rank {i}: {item['id']} ({item['year']})</strong>
-                            <span style="color: #10b981;">[{item['meta']['status']}]</span>
+                st.markdown("""
+                <div class="action-card">
+                    <div>
+                        <div class="action-card-icon">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e5de3" stroke-width="2"><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="M7 21h10"/><path d="M12 3v18"/><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></svg>
                         </div>
-                        <div style="font-size: 0.75rem; color: #64748b; margin: 0.25rem 0;">Adjusted Score: {item['score']:.4f} (Decay: {item['penalty']:.4f})</div>
-                        <div style="font-size: 0.8125rem; color: #cbd5e1;">{item['text']}</div>
+                        <div style="font-weight: 700; font-size: 0.95rem; color: #fff; margin-bottom: 0.2rem;">Compare Regulations</div>
+                        <div style="font-size: 0.785rem; color: #798da8;">View year-to-year changes and amendments</div>
+                    </div>
+                    <div style="text-align: right; color: #1e5de3; font-weight: 600;">➔</div>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("Open Comparison", key="lic_act_comp", use_container_width=True):
+                    st.session_state["lic_screen"] = "COMPARE"
+                    st.rerun()
+
+            with c3:
+                st.markdown("""
+                <div class="action-card">
+                    <div>
+                        <div class="action-card-icon">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e5de3" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                        </div>
+                        <div style="font-weight: 700; font-size: 0.95rem; color: #fff; margin-bottom: 0.2rem;">Regulatory Timeline</div>
+                        <div style="font-size: 0.785rem; color: #798da8;">Track key policy updates chronologically</div>
+                    </div>
+                    <div style="text-align: right; color: #1e5de3; font-weight: 600;">➔</div>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("Open Timeline", key="lic_act_tl", use_container_width=True):
+                    st.session_state["lic_screen"] = "TIMELINE"
+                    st.rerun()
+
+            with c4:
+                st.markdown("""
+                <div class="action-card">
+                    <div>
+                        <div class="action-card-icon">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e5de3" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h10"/><path d="M6 10h10"/></svg>
+                        </div>
+                        <div style="font-weight: 700; font-size: 0.95rem; color: #fff; margin-bottom: 0.2rem;">Document Library</div>
+                        <div style="font-size: 0.785rem; color: #798da8;">Search and browse official documents</div>
+                    </div>
+                    <div style="text-align: right; color: #1e5de3; font-weight: 600;">➔</div>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("Open Library", key="lic_act_lib", use_container_width=True):
+                    st.session_state["lic_screen"] = "LIBRARY"
+                    st.rerun()
+
+            st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+            q_in, btn_ask = st.columns([10, 2])
+            with q_in:
+                q_val = st.text_input("Question Input", placeholder="Ask a question about LIC policies, rules or circulars...", label_visibility="collapsed")
+            with btn_ask:
+                if st.button("Ask", key="btn_lic_ask_main", type="primary", use_container_width=True):
+                    if q_val:
+                        st.session_state["lic_qa_query"] = q_val
+                    st.session_state["lic_screen"] = "QA"
+                    st.rerun()
+
+            up_col, _ = st.columns([2.5, 9.5])
+            with up_col:
+                if st.button("⬆ Upload & Verify", key="btn_lic_up_trig", use_container_width=True):
+                    st.session_state["lic_screen"] = "LIBRARY"
+                    st.rerun()
+
+            st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
+            t_head, t_viewall = st.columns([9.5, 2.5])
+            with t_head:
+                st.markdown("<div style='font-size: 1.05rem; font-weight: 700; color: #ffffff;'>Recently verified documents</div>", unsafe_allow_html=True)
+            with t_viewall:
+                if st.button("View all ➔", key="btn_view_all_rec"):
+                    st.session_state["lic_screen"] = "LIBRARY"
+                    st.rerun()
+
+            st.markdown("""
+            <table class="policy-table" style="margin-top: 0.65rem;">
+                <thead><tr><th>Title</th><th>Authority</th><th>Type</th><th>Published</th><th>Status</th></tr></thead>
+                <tbody>
+                    <tr><td>IRDAI Master Circular on Life Insurance Products - 2024</td><td>IRDAI</td><td>Master Circular</td><td>Oct 12, 2024</td><td><span class="badge-verified">Verified</span></td></tr>
+                    <tr><td>LIC - Surrender Value Trends</td><td>LIC</td><td>Circular</td><td>Jan 15, 2025</td><td><span class="badge-verified">Verified</span></td></tr>
+                    <tr><td>EPFO - Medical Processing Delay</td><td>EPFO</td><td>Social Security</td><td>Apr 28, 2026</td><td><span class="badge-pending">Pending</span></td></tr>
+                </tbody>
+            </table>
+            """, unsafe_allow_html=True)
+
+        # SCREEN 2: Ask a Policy Question
+        elif st.session_state["lic_screen"] == "QA":
+            if st.button("← Back to LIC Portal", key="btn_qa_back"):
+                st.session_state["lic_screen"] = "HUB"
+                st.rerun()
+
+            st.markdown("""<div class="hero-title">Ask a Policy Question</div><div class="hero-sub">Get accurate answers from verified LIC / IRDAI documents using RAG.</div>""", unsafe_allow_html=True)
+            in_col, find_col = st.columns([10, 2])
+            with in_col:
+                current_q = st.text_input("Query", value=st.session_state["lic_qa_query"], placeholder="Ask about surrender value, policy rules, or a circular...", label_visibility="collapsed")
+            with find_col:
+                st.button("Find Answer", key="btn_find_ans", type="primary", use_container_width=True)
+
+            st.markdown("<div style='font-size: 0.8125rem; color: #64748b; margin-top: 0.65rem; margin-bottom: 0.35rem;'>Example questions:</div>", unsafe_allow_html=True)
+            eq1, eq2, eq3 = st.columns(3)
+            if eq1.button("What are the latest changes in LIC surrender value rules?", key="eq_1", use_container_width=True):
+                st.session_state["lic_qa_query"] = "What are the latest changes in LIC surrender value rules?"
+                st.rerun()
+            if eq2.button("Compare LIC regulations from 2024 to 2026.", key="eq_2", use_container_width=True):
+                st.session_state["lic_qa_query"] = "Compare LIC regulations from 2024 to 2026."
+                st.rerun()
+            if eq3.button("Show details of a specific circular or notification.", key="eq_3", use_container_width=True):
+                st.session_state["lic_qa_query"] = "Show details of a specific circular or notification."
+                st.rerun()
+
+            st.markdown("<div style='margin-top: 1.25rem;'></div>", unsafe_allow_html=True)
+            f_l, f_r = st.columns([6, 6])
+            with f_l:
+                st.checkbox("Verified sources only ⓘ", value=True)
+            with f_r:
+                r1, r2 = st.columns([6, 6])
+                with r1:
+                    st.markdown("<div style='text-align: right; font-size: 0.8125rem; color: #798da8; padding-top: 0.45rem;'>How current should results be?</div>", unsafe_allow_html=True)
+                with r2:
+                    st.selectbox("Recency", ["Latest available", "2024 Regime", "2020 Baseline"], label_visibility="collapsed")
+
+            st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='font-size: 1.05rem; font-weight: 700; color: #ffffff;'>Answer</div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div style="background-color: #070e1c; border: 1px solid #14284b; border-radius: 8px; padding: 1.25rem; line-height: 1.6; font-size: 0.875rem; color: #e2e8f0; margin-bottom: 1.5rem;">
+                Based on the verified documents, the surrender value rules for LIC policies are governed by the latest IRDAI master circular and relevant policy conditions. The surrender value depends on the policy type, premium payment term, and the policy year.
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("<div style='font-size: 0.95rem; font-weight: 700; color: #ffffff; margin-bottom: 0.65rem;'>Cited Sources</div>", unsafe_allow_html=True)
+            cs1, cs2 = st.columns(2)
+            with cs1:
+                st.markdown("""
+                <div class="citation-card">
+                    <div style="display: flex; gap: 0.75rem; align-items: center;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1e5de3" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></svg>
+                        <div>
+                            <div style="font-weight: 600; font-size: 0.84rem; color: #ffffff;">IRDAI Master Circular - 2024</div>
+                            <div style="font-size: 0.75rem; color: #64748b;">Page 4</div>
+                        </div>
+                    </div>
+                    <div style="color: #64748b;">➔</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with cs2:
+                st.markdown("""
+                <div class="citation-card">
+                    <div style="display: flex; gap: 0.75rem; align-items: center;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1e5de3" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></svg>
+                        <div>
+                            <div style="font-weight: 600; font-size: 0.84rem; color: #ffffff;">LIC Circular - Surrender Value</div>
+                            <div style="font-size: 0.75rem; color: #64748b;">Page 2</div>
+                        </div>
+                    </div>
+                    <div style="color: #64748b;">➔</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # SCREEN 3: Compare Regulations
+        elif st.session_state["lic_screen"] == "COMPARE":
+            if st.button("← Back to LIC Portal", key="btn_compare_back"):
+                st.session_state["lic_screen"] = "HUB"
+                st.rerun()
+
+            st.markdown("""<div class="hero-title">Compare Regulations</div><div class="hero-sub">View year-to-year changes in LIC / IRDAI regulations.</div>""", unsafe_allow_html=True)
+            f_c1, f_c2, f_c3, f_c4 = st.columns([3, 3, 4, 2])
+            with f_c1:
+                st.caption("From Year")
+                st.selectbox("From Year", [2020, 2022, 2024], index=2, label_visibility="collapsed")
+            with f_c2:
+                st.caption("To Year")
+                st.selectbox("To Year", [2024, 2025, 2026], index=2, label_visibility="collapsed")
+            with f_c3:
+                st.caption("Change Type")
+                st.selectbox("Change Type", ["All Changes", "Surrender Value", "Charges", "Policy Term", "Bonus Rate"], label_visibility="collapsed")
+            with f_c4:
+                st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
+                st.button("Compare", type="primary", use_container_width=True)
+
+            st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='font-size: 1.05rem; font-weight: 700; color: #ffffff;'>Comparison Results (5 changes)</div>", unsafe_allow_html=True)
+            st.markdown("""
+            <table class="policy-table">
+                <thead><tr><th>Topic</th><th>Earlier Rule</th><th>Current Rule</th><th>Effective Date</th><th>Source</th></tr></thead>
+                <tbody>
+                    <tr><td><strong>Surrender Value</strong></td><td>80% after 2 years</td><td>85% after 2 years</td><td>Jan 15, 2025</td><td><span style="color: #60a5fa;">Circular ↗</span></td></tr>
+                    <tr><td><strong>Premium Payment</strong></td><td>Annual</td><td>Semi-annual (option)</td><td>Apr 01, 2026</td><td><span style="color: #60a5fa;">Notification ↗</span></td></tr>
+                    <tr><td><strong>ULIP Charges</strong></td><td>Higher charges</td><td>Reduced charges</td><td>Mar 12, 2025</td><td><span style="color: #60a5fa;">Master Circular ↗</span></td></tr>
+                    <tr><td><strong>Policy Term</strong></td><td>10 years</td><td>12 years (new plans)</td><td>Jul 10, 2026</td><td><span style="color: #60a5fa;">Circular ↗</span></td></tr>
+                    <tr><td><strong>Bonus Rate</strong></td><td>Fixed rate</td><td>Variable (linked)</td><td>Oct 01, 2025</td><td><span style="color: #60a5fa;">Guideline ↗</span></td></tr>
+                </tbody>
+            </table>
+            """, unsafe_allow_html=True)
+
+            st.markdown("""
+            <div style="text-align: center; margin-top: 2rem; color: #64748b;">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                <div style="font-size: 0.8125rem; margin-top: 0.25rem;">No results found<br/>Try another year or change the filter type.</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # SCREEN 4: Regulatory Timeline
+        elif st.session_state["lic_screen"] == "TIMELINE":
+            if st.button("← Back to LIC Portal", key="btn_tl_back"):
+                st.session_state["lic_screen"] = "HUB"
+                st.rerun()
+
+            st.markdown("""<div class="hero-title">Regulatory Timeline</div><div class="hero-sub">Key LIC / IRDAI policy updates in chronological order.</div>""", unsafe_allow_html=True)
+            items = [
+                ("Mar 12, 2025", "Effective: Apr 01, 2025", "IRDAI Master Circular on Unit Linked Insurance Products", "IRDAI", "Revised guidelines for ULIP charges and fund segregation."),
+                ("Jan 15, 2025", "Effective: Jan 15, 2025", "Guidelines on Surrender Value and Lock-in Periods", "LIC", "Updated surrender value calculation and lock-in period rules."),
+                ("Oct 12, 2024", "Effective: Oct 12, 2024", "IRDAI Master Circular on Life Insurance Products", "IRDAI", "Comprehensive framework for product governance and disclosures.")
+            ]
+            for dt, eff, tit, aut, desc in items:
+                d_col, c_col = st.columns([3, 9])
+                with d_col:
+                    st.markdown(f"""
+                    <div style="display:flex; gap:0.75rem; margin-top:0.75rem;">
+                        <span class="timeline-dot" style="margin-top:6px;"></span>
+                        <div>
+                            <div style="font-weight:700; color:#fff;">{dt}</div>
+                            <div style="font-size:0.75rem; color:#64748b;">Published</div>
+                            <div style="font-size:0.75rem; color:#94a3b8;">{eff}</div>
+                        </div>
                     </div>
                     """, unsafe_allow_html=True)
+                with c_col:
+                    with st.container(border=True):
+                        st.markdown(f"**{tit}**")
+                        st.caption(f"Authority: **{aut}**")
+                        st.write(desc)
+                        st.markdown("<span style='color: #60a5fa; font-size: 0.8125rem; cursor: pointer;'>View source ➔</span>", unsafe_allow_html=True)
+
+        # SCREEN 5: Document Library & Upload
+        elif st.session_state["lic_screen"] == "LIBRARY":
+            if st.button("← Back to LIC Portal", key="btn_lib_back"):
+                st.session_state["lic_screen"] = "HUB"
+                st.rerun()
+
+            s_l, s_r = st.columns([7, 5])
+            with s_l:
+                st.markdown("""<div style="font-size:1.35rem; font-weight:700; color:#fff;">Verified Documents</div><div style="font-size:0.8125rem; color:#798da8; margin-bottom:1rem;">Search and browse official LIC / IRDAI documents.</div>""", unsafe_allow_html=True)
+                st.text_input("Search Library", placeholder="Search by title, reference number, or keywords...", label_visibility="collapsed")
+                
+                fl1, fl2, fl3, fl4 = st.columns(4)
+                fl1.selectbox("Org", ["All Organizations", "IRDAI", "LIC", "EPFO"], label_visibility="collapsed")
+                fl2.selectbox("Type", ["All Types", "Master Circular", "Circular", "Guideline"], label_visibility="collapsed")
+                fl3.selectbox("Period", ["2020 - 2026", "2024 - 2026", "2020 - 2024"], label_visibility="collapsed")
+                fl4.selectbox("Status", ["All Status", "Verified", "Pending"], label_visibility="collapsed")
+
+                st.markdown("""
+                <table class="policy-table">
+                    <thead><tr><th>Title</th><th>Authority</th><th>Type</th><th>Date</th><th>Status</th></tr></thead>
+                    <tbody>
+                        <tr><td>IRDAI Master Circular - 2024</td><td>IRDAI</td><td>Master Circular</td><td>Oct 12, 2024</td><td><span class="badge-verified">Verified</span></td></tr>
+                        <tr><td>LIC - Surrender Value Trends</td><td>LIC</td><td>Circular</td><td>Jan 15, 2025</td><td><span class="badge-verified">Verified</span></td></tr>
+                        <tr><td>EPFO - Medical Processing Delay</td><td>EPFO</td><td>Circular</td><td>Apr 28, 2026</td><td><span class="badge-pending">Pending</span></td></tr>
+                        <tr><td>Indian Railways - Ticketing Rules</td><td>Indian Railways</td><td>Guideline</td><td>Jul 10, 2026</td><td><span class="badge-verified">Verified</span></td></tr>
+                        <tr><td>LIC - ULIP Policy Changes</td><td>LIC</td><td>Circular</td><td>Mar 12, 2025</td><td><span class="badge-verified">Verified</span></td></tr>
+                    </tbody>
+                </table>
+                """, unsafe_allow_html=True)
+
+                st.markdown("<div style='margin-top: 1rem;'></div>", unsafe_allow_html=True)
+                pag_l, pag_r = st.columns([6, 6])
+                pag_l.caption("Showing 1-5 of 12 documents")
+                with pag_r:
+                    p1, p2, p3, p4, p5 = st.columns(5)
+                    p1.button("<", key="p_prev")
+                    p2.button("1", type="primary", key="p_1")
+                    p3.button("2", key="p_2")
+                    p4.button("3", key="p_3")
+                    p5.button(">", key="p_next")
+
+            with s_r:
+                with st.container(border=True):
+                    st.markdown("##### ⌃ Add a Document")
+                    st.caption("Upload File (PDF, TXT, HTML)")
+                    st.file_uploader("Upload File", type=["pdf", "txt", "html"], label_visibility="collapsed")
+                    
+                    st.text_input("Document Title *", placeholder="Enter document title")
+                    st.selectbox("Authority *", ["Select authority", "IRDAI", "LIC of India", "EPFO", "Indian Railways"])
+                    
+                    r1, r2 = st.columns(2)
+                    with r1:
+                        st.text_input("Reference Number", placeholder="e.g., IRDAI/ACT/...")
+                        st.date_input("Effective Date (if available)", value=datetime.date.today())
+                    with r2:
+                        st.date_input("Publication Date", value=datetime.date.today())
+                        st.text_input("Official URL", placeholder="https://example.com")
+                    
+                    st.text_area("Short Summary", placeholder="Brief description of the document...")
+                    st.button("Submit for Verification", type="primary", use_container_width=True)
 
 # ==============================================================================
 # TAB 2: REPORTS & BENCHMARKS
