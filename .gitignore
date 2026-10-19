@@ -10,3 +10,10 @@ chroma_db/
 *.log
 .env
 .streamlit/secrets.toml
+
+# ChronoRAG local data
+chronorag.db
+*.db
+.venv/
+__pycache__/
+.streamlit/secrets.toml
